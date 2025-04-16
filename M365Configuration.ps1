@@ -209,9 +209,7 @@ $ReportHtml = $Summary | ConvertTo-Html -Property UPN, Company, Title, MailboxAc
 $ReportFile = Join-Path $LogPath "O365MigrationReport-$Timestamp.html"
 $ReportHtml | Out-File -FilePath $ReportFile -Encoding UTF8
 
-if (-not $DryRun) {
-    Send-MailMessage -From $SMTPFrom -To $SMTPTo -Cc $SMTPCC -Subject "O365 Migration Report - $Timestamp" -BodyAsHtml -Body ($ReportHtml -join "`n") -SmtpServer $SMTPServer -Port 25
-}
+Send-MailMessage -From $SMTPFrom -To $SMTPTo -Cc $SMTPCC -Subject "O365 Migration Report - $Timestamp" -BodyAsHtml -Body ($ReportHtml -join "`n") -SmtpServer $SMTPServer -Port 25
 
 $CsvFile = Join-Path $LogPath "O365MigrationReport-$Timestamp.csv"
 $Summary | Export-Csv -Path $CsvFile -NoTypeInformation -Encoding UTF8
