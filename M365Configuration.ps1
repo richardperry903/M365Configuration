@@ -205,26 +205,25 @@ foreach ($User in $FilteredUsers) {
 # =============================
 # REPORTING AND EMAIL
 # =============================
-$ReportHtml = $Summary | ConvertTo-Html -Property UPN, Company, Title, MailboxAction, LicenseAction, Status, Notes -Title "O365 Migration Report - $Timestamp" -PreContent "<h2>O365 Migration Summary</h2><p>Dry Run Mode: $DryRun</p>"
-$ReportFile = Join-Path $LogPath "O365MigrationReport-$Timestamp.html"
-$ReportHtml | Out-File -FilePath $ReportFile -Encoding UTF8
-
-Send-MailMessage -From $SMTPFrom -To $SMTPTo -Cc $SMTPCC -Subject "O365 Migration Report - $Timestamp" -BodyAsHtml -Body ($ReportHtml -join "`n") -SmtpServer $SMTPServer -Port 25
-
-$CsvFile = Join-Path $LogPath "O365MigrationReport-$Timestamp.csv"
-$Summary | Export-Csv -Path $CsvFile -NoTypeInformation -Encoding UTF8
-
-Write-Host "HTML report saved to: $ReportFile"
-Write-Host "CSV report saved to: $CsvFile"
-
 $SuccessCount = ($Summary | Where-Object { $_.Status -eq "Success" }).Count
 $WarningCount = ($Summary | Where-Object { $_.Status -eq "Warning" }).Count
 $FailureCount = ($Summary | Where-Object { $_.Status -eq "Failed" }).Count
+$ModifiedCount = ($Summary | Where-Object { $_.MailboxAction -ne "Cloud mailbox exists" -or $_.LicenseAction -ne "Already assigned" }).Count
+$TotalCount = $Summary.Count
 
-Write-Host "Summary: $SuccessCount Success, $WarningCount Warnings, $FailureCount Failed"
+$SummaryHeader = @"
+<h2>O365 Migration Summary</h2>
+<ul>
+<li><strong>Total Users Processed:</strong> $TotalCount</li>
+<li><strong>Modified:</strong> $ModifiedCount</li>
+<li><strong>Successes:</strong> $SuccessCount</li>
+<li><strong>Warnings:</strong> $WarningCount</li>
+<li><strong>Failures:</strong> $FailureCount</li>
+</ul>
+"@
 
-$EndTime = Get-Date
-$Elapsed = New-TimeSpan -Start $StartTime -End $EndTime
-Write-Host "Total elapsed time: $($Elapsed.ToString())"
+$FailureSection = $Summary | Where-Object { $_.Status -eq "Failed" } | ConvertTo-Html -Property UPN, Company, Title, MailboxAction, LicenseAction, Status, Notes -Fragment -PreContent "<h3>Failures Only</h3>"
 
-Stop-Transcript
+$FullReportSection = $Summary | ConvertTo-Html -Property UPN, Company, Title, MailboxAction, LicenseAction, Status, Notes -Fragment -PreContent "<h3>Full Report</h3>"
+
+$ReportHtml = "<html><body>$SummaryHeader$FailureSection$FullReportSection</body></html>"
