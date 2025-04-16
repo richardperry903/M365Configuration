@@ -155,7 +155,7 @@ foreach ($User in $FilteredUsers) {
 
         $GraphUser = Get-MgUser -UserId $UPN -ErrorAction Stop
         $CurrentLicenses = ($GraphUser.AssignedLicenses | ForEach-Object { $_.SkuId })
-        $Key = switch -Wildcard ($Company, $Title) {
+        $Key = switch -Wildcard ( @($Company, $Title) ) {
             { $_[0] -eq 'CUSSD' -and $_[1] -eq 'student' } { 'CUSSD_Student'; break }
             { $_[0] -eq 'SCS' -and $_[1] -eq 'student' }   { 'SCS_Student'; break }
             { $_[0] -eq 'CUSSD' -and $_[1] -ne 'student' } { 'CUSSD_Staff'; break }
