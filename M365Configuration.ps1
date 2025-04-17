@@ -158,9 +158,9 @@ foreach ($User in $FilteredUsers) {
         $Key = switch -Wildcard ( @($Company, $Title) ) {
             { $_[0] -eq 'CUSSD' -and $_[1] -eq 'student' } { 'CUSSD_Student'; break }
             { $_[0] -eq 'SCS' -and $_[1] -eq 'student' }   { 'SCS_Student'; break }
-            { $_[0] -eq 'CUSSD' -and $_[1] -ne 'student' } { 'CUSSD_Staff'; break }
-            { $_[0] -eq 'SCS' -and $_[1] -ne 'student' }   { 'SCS_Staff'; break }
-            { $_[0] -eq 'SMCC' -and $_[1] -ne 'student' }  { 'SMCC_Staff'; break }
+            { $_[0] -eq 'CUSSD' -and ($_[1] -ne 'student' -or $_[1] -eq $null) } { 'CUSSD_Staff'; break }
+            { $_[0] -eq 'SCS' -and ($_[1] -ne 'student' -or $_[1] -eq $null) }   { 'SCS_Staff'; break }
+            { $_[0] -eq 'SMCC' -and ($_[1] -ne 'student' -or $_[1] -eq $null) }  { 'SMCC_Staff'; break }
             default { $null }
         }
 
