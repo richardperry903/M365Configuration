@@ -155,13 +155,19 @@ foreach ($User in $FilteredUsers) {
 
         $GraphUser = Get-MgUser -UserId $UPN -ErrorAction Stop
         $CurrentLicenses = ($GraphUser.AssignedLicenses | ForEach-Object { $_.SkuId })
-        $Key = switch -Wildcard ( @($Company, $Title) ) {
-            { $_[0] -eq 'CUSSD' -and $_[1] -eq 'student' } { 'CUSSD_Student'; break }
-            { $_[0] -eq 'SCS' -and $_[1] -eq 'student' }   { 'SCS_Student'; break }
-            { $_[0] -eq 'CUSSD' -and ($_[1] -ne 'student' -or $_[1] -eq $null) } { 'CUSSD_Staff'; break }
-            { $_[0] -eq 'SCS' -and ($_[1] -ne 'student' -or $_[1] -eq $null) }   { 'SCS_Staff'; break }
-            { $_[0] -eq 'SMCC' -and ($_[1] -ne 'student' -or $_[1] -eq $null) }  { 'SMCC_Staff'; break }
-            default { $null }
+        # Determine license category
+        if ($Company -eq 'CUSSD' -and $Title -eq 'student') {
+            $Key = 'CUSSD_Student'
+        } elseif ($Company -eq 'SCS' -and $Title -eq 'student') {
+            $Key = 'SCS_Student'
+        } elseif ($Company -eq 'CUSSD' -and (-not $Title -or $Title -ne 'student')) {
+            $Key = 'CUSSD_Staff'
+        } elseif ($Company -eq 'SCS' -and (-not $Title -or $Title -ne 'student')) {
+            $Key = 'SCS_Staff'
+        } elseif ($Company -eq 'SMCC' -and (-not $Title -or $Title -ne 'student')) {
+            $Key = 'SMCC_Staff'
+        } else {
+            $Key = $null
         }
 
         if ($Key -and $LicenseMap.ContainsKey($Key)) {
