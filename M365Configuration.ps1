@@ -1,44 +1,51 @@
 <#
-Script:  Hybrid-Provisioning.ps1
+M365Automation.ps1
 Author: Richard
-Version: 0.1
+Version: 0.2
 Updated: 2025-09-19
 
-Purpose:
-  Automate user hygiene + hybrid mailbox handling + cloud normalization (usageLocation),
-  across SMCC, SCS, and CUSSD, with policy exceptions for CUSSD students.
+Purpose
+  - Step 1: Environment & connectivity checks (AD, Exchange on-prem, Graph app-only)
+  - Step 2: AD hygiene (adminDescription)
+  - Step 3: Hybrid mailbox handling (Local->Remote / None->Remote) per org policy
+  - Step 4: Normalize usageLocation = "US" in Entra ID
 
-Requirements:
-  - PowerShell 7+ (recommended), RSAT ActiveDirectory
-  - Microsoft.Graph PowerShell SDK
-  - On-prem Exchange 2016 remote PSSession access (Kerberos)
-  - Graph App Registration (cert-based), with app permissions admin-consented:
-      User.ReadWrite.All (for Step 4 now; more for licensing later)
+Policy
+  - SMCC: all users -> RemoteMailbox
+  - SCS : all users -> RemoteMailbox
+  - CUSSD: Employees only -> RemoteMailbox; Students (Title='Student') -> SKIP (Google only)
 
-Run Modes:
-  - Set $ApplyChanges = $false for dry run (safe preview)
-  - Set $ApplyChanges = $true  to make changes
+Run Modes
+  - $ApplyChanges = $false (dry-run) or $true (apply)
+  - $VerboseMode  = $true  (chatty/testing) or $false (quiet/scheduled)
 
-Scheduling:
-  - Run with a service/admin account that can read the cert/PFX location and has AD/Exchange rights.
+Notes
+  - Requires: RSAT ActiveDirectory, Microsoft.Graph PowerShell SDK
+  - Exchange 2016 on-prem remoting (Kerberos)
+  - Graph App Registration (cert-based) with User.ReadWrite.All (for Step 4)
 #>
 
 # ==============================
-# 1) GLOBAL VARIABLES
+# GLOBAL TOGGLES / VARIABLES
 # ==============================
 $ErrorActionPreference = 'Stop'
 
-# Tenant / App
+# ---- Toggles ----
+$ApplyChanges = $false       # $true to actually make changes
+$VerboseMode  = $true        # $true = verbose; $false = quiet but still shows progress + final summary
+
+# ---- Tenant / App / Cert ----
 $TenantId   = "3dcf5cc9-81b0-4bb3-8098-64ec361b3fbc"
 $AppId      = "606f3b5e-c644-4831-bc6e-73b6d34e02e4"
 
-# Cert auth: choose ONE mode
-$CertMode   = "Thumbprint"  # "Thumbprint" or "PfxFile"
+$CertMode   = "Thumbprint"   # "Thumbprint" or "PfxFile"
 $Thumbprint = "C26E01D2EB72084DCC91DB9350C8A510F6059B92"
-$PfxPath    = "\\smmnet\shared\SMCC-InformationTechnologyAdministration\Scripts\O365\GraphApp.pfx"
-$PfxPass    = ConvertTo-SecureString "P@ssw0rd" -AsPlainText -Force  # TODO: replace with secure secret source
 
-# OU Scope (recursive)
+# PFX mode (UNC/local). Replace password handling before production.
+$PfxPath    = "\\smmnet\shared\SMCC-InformationTechnologyAdministration\Scripts\O365\GraphApp.pfx"
+$PfxPass    = ConvertTo-SecureString "P@ssw0rd" -AsPlainText -Force
+
+# ---- OU Scope (recursive) ----
 $OUs = @{
   SMCCStaff     = "OU=smcc,DC=smmnet,DC=local"
   SCSStaff      = "OU=scs,DC=smmnet,DC=local"
@@ -47,35 +54,48 @@ $OUs = @{
   SCSStudents   = "OU=san diego,OU=scs,OU=students,DC=smmnet,DC=local"
 }
 
-# Domains & addressing
+# ---- Domains / addressing ----
 $PrimaryDomainByCompany = @{
   'SCS'   = 'socalsem.edu'
   'SMCC'  = 'shadowmountain.org'
-  'CUSSD' = 'christianunified.org'   # employees only; CUSSD students use Google
+  'CUSSD' = 'christianunified.org'   # employees only
 }
-$TenantInitialDomain  = 'smmnet.onmicrosoft.com'
-$RemoteRoutingSuffix  = ($TenantInitialDomain -replace 'onmicrosoft.com$','mail.onmicrosoft.com')  # smmnet.mail.onmicrosoft.com
-$FallbackPrimaryDomain = 'nonroutable.invalid'  # intentional to surface misconfigs
-
-# Toggles
-$ApplyChanges = $false      # global safety switch
-$VerbosePreference = 'SilentlyContinue'
+$TenantInitialDomain   = 'smmnet.onmicrosoft.com'
+$RemoteRoutingSuffix   = ($TenantInitialDomain -replace 'onmicrosoft.com$','mail.onmicrosoft.com')
+$FallbackPrimaryDomain = 'nonroutable.invalid'  # deliberate to surface misconfigs
 
 # ==============================
-# 2) FUNCTIONS
+# LOGGING & PROGRESS HELPERS
 # ==============================
-
-function Write-Note { param([string]$Msg) Write-Host $Msg -ForegroundColor Cyan }
-function Write-Ok   { param([string]$Msg) Write-Host $Msg -ForegroundColor Green }
+function Write-Info { param([string]$Msg) if ($VerboseMode) { Write-Host $Msg -ForegroundColor DarkCyan } }
+function Write-Note { param([string]$Msg) if ($VerboseMode) { Write-Host $Msg -ForegroundColor Cyan } }
+function Write-Ok   { param([string]$Msg) if ($VerboseMode) { Write-Host $Msg -ForegroundColor Green } }
 function Write-Wrn  { param([string]$Msg) Write-Warning $Msg }
 function Write-Err  { param([string]$Msg) Write-Host $Msg -ForegroundColor Red }
 
+# Always-on status line (even when verbose off)
+function Write-Status { param([string]$Msg) Write-Host $Msg -ForegroundColor Gray }
+
+# Progress wrapper (Activity/Status/Percent)
+function Show-Progress {
+  param(
+    [string]$Activity,
+    [string]$Status,
+    [int]$Percent
+  )
+  if ($Percent -lt 0) { $Percent = 0 }
+  if ($Percent -gt 100) { $Percent = 100 }
+  Write-Progress -Activity $Activity -Status $Status -PercentComplete $Percent
+}
+
+# ==============================
+# FUNCTION: MODULES / CONNECTIONS
+# ==============================
 function Ensure-Modules {
-  # Installs/loads required modules (idempotent)
   $mods = @('ActiveDirectory','Microsoft.Graph')
   foreach ($m in $mods) {
     if (-not (Get-Module -ListAvailable -Name $m)) {
-      Write-Note "Installing module: $m"
+      Write-Status "Installing module: $m"
       Install-Module -Name $m -Force -Scope AllUsers -AllowClobber
     }
     Import-Module $m -ErrorAction Stop
@@ -84,38 +104,33 @@ function Ensure-Modules {
 }
 
 function Connect-ExchangeOnPrem {
-  # Connects on-prem Exchange with prefix E2016 (Kerberos)
   if (-not (Get-Command Get-E2016Mailbox -ErrorAction SilentlyContinue)) {
-    Write-Note "Connecting to on-prem Exchange (E2016)…"
+    Write-Status "Connecting to on-prem Exchange (E2016)…"
     $Exch2016 = New-PSSession -ConfigurationName Microsoft.Exchange -ConnectionUri http://exch2016/PowerShell/ -Authentication Kerberos
     Import-PSSession $Exch2016 -Prefix E2016 -DisableNameChecking -AllowClobber | Out-Null
-    Write-Ok "Exchange cmdlets imported with prefix 'E2016'."
-  } else {
-    Write-Ok "Exchange session already available."
   }
+  Write-Ok "Exchange on-prem connected (E2016)."
 }
 
 function Connect-GraphAppOnly {
-  # Connects Graph via cert (app-only)
   if (Get-MgContext) { Write-Ok "Graph already connected."; return }
-  Write-Note "Connecting to Microsoft Graph (app-only)…"
+  Write-Status "Connecting to Microsoft Graph (app-only)…"
   switch ($CertMode) {
-    'Thumbprint' {
-      Connect-MgGraph -TenantId $TenantId -ClientId $AppId -CertificateThumbprint $Thumbprint | Out-Null
-    }
-    'PfxFile' {
-      $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($PfxPath, $PfxPass)
-      Connect-MgGraph -TenantId $TenantId -ClientId $AppId -Certificate $cert | Out-Null
-    }
-    default { throw "CertMode must be 'Thumbprint' or 'PfxFile'." }
+    'Thumbprint' { Connect-MgGraph -TenantId $TenantId -ClientId $AppId -CertificateThumbprint $Thumbprint | Out-Null }
+    'PfxFile'    { $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($PfxPath, $PfxPass)
+                   Connect-MgGraph -TenantId $TenantId -ClientId $AppId -Certificate $cert | Out-Null }
+    default      { throw "CertMode must be 'Thumbprint' or 'PfxFile'." }
   }
   Write-Ok "Graph connected."
 }
 
+# ==============================
+# FUNCTION: ADDRESS BUILDER
+# ==============================
 function Get-PlannedAddresses {
   <#
-    Returns the Primary SMTP and Remote Routing Address.
-    If Company not mapped, returns alias@nonroutable.invalid to surface misconfigurations.
+    Returns Primary SMTP and Remote Routing Address for a SAM/Company.
+    If Company not mapped, uses alias@nonroutable.invalid to flag misconfig.
   #>
   param(
     [Parameter(Mandatory)][string]$Sam,
@@ -133,48 +148,44 @@ function Get-PlannedAddresses {
   [pscustomobject]@{ Primary=$primary; Remote=$remote; UsedFallback=$usedFallback }
 }
 
-# --- Step wrappers to keep main flow clean ---
-
+# ==============================
+# STEP 2 — AD HYGIENE
+# ==============================
 function Step-2_ADHygiene {
-  <#
-    Clear adminDescription for enabled users, set to "User_NoSync" for disabled.
-    Safe to run repeatedly.
-  #>
-  Write-Note "STEP 2: AD hygiene (adminDescription)…"
+  Write-Status "STEP 2: AD hygiene (adminDescription)…"
   # Enabled -> clear
-  Get-ADUser -Filter 'Enabled -eq $true' -Properties adminDescription |
-    Where-Object { $_.adminDescription } |
-    ForEach-Object {
-      if ($ApplyChanges) { Set-ADUser $_ -Clear adminDescription }
-      Write-Host ("Cleared adminDescription: {0}" -f $_.SamAccountName) -ForegroundColor DarkYellow
+  $enabled = Get-ADUser -Filter 'Enabled -eq $true' -Properties adminDescription
+  $count = ($enabled | Measure-Object).Count
+  $i = 0
+  foreach ($u in $enabled) {
+    $i++
+    Show-Progress -Activity "AD Hygiene: Enabled" -Status "$i of $count" -Percent ([int](100*$i/$count))
+    if ($u.adminDescription) {
+      Write-Info ("Clearing adminDescription: {0}" -f $u.SamAccountName)
+      if ($ApplyChanges) { Set-ADUser $u -Clear adminDescription }
     }
-
-  # Disabled -> set
-  Get-ADUser -Filter 'Enabled -eq $false' -Properties adminDescription |
-    ForEach-Object {
-      if ($ApplyChanges) { Set-ADUser $_ -Replace @{adminDescription = 'User_NoSync'} }
-      Write-Host ("Set adminDescription=User_NoSync: {0}" -f $_.SamAccountName) -ForegroundColor DarkYellow
+  }
+  # Disabled -> set "User_NoSync"
+  $disabled = Get-ADUser -Filter 'Enabled -eq $false' -Properties adminDescription
+  $count = ($disabled | Measure-Object).Count
+  $i = 0
+  foreach ($u in $disabled) {
+    $i++
+    Show-Progress -Activity "AD Hygiene: Disabled" -Status "$i of $count" -Percent ([int](100*$i/$count))
+    if ($u.adminDescription -ne 'User_NoSync') {
+      Write-Info ("Setting adminDescription=User_NoSync: {0}" -f $u.SamAccountName)
+      if ($ApplyChanges) { Set-ADUser $u -Replace @{adminDescription='User_NoSync'} }
     }
-
+  }
+  Show-Progress -Activity "AD Hygiene" -Status "Complete" -Percent 100
   Write-Ok "STEP 2 complete."
 }
 
+# ==============================
+# STEP 3 — HYBRID MAILBOX HANDLING
+# ==============================
 function Step-3_HybridMailboxes {
-  <#
-    Policy:
-      - SMCC: RemoteMailbox required
-      - SCS : RemoteMailbox required
-      - CUSSD: Employees only; Students (Title='Student') skipped
-    Action:
-      - Local -> Remote: Disable-E2016Mailbox, then Enable-E2016RemoteMailbox
-      - None  -> Remote: Enable-E2016RemoteMailbox
-    Addressing:
-      - Primary from $PrimaryDomainByCompany
-      - Remote routing: alias@$RemoteRoutingSuffix
-      - If Company unmapped: use alias@nonroutable.invalid (intentional)
-  #>
-  Write-Note "STEP 3: Hybrid mailbox handling…"
-
+  Write-Status "STEP 3: Hybrid mailbox handling…"
   $Converted    = @()
   $Enabled      = @()
   $Skipped      = @()
@@ -182,44 +193,59 @@ function Step-3_HybridMailboxes {
   $Failures     = @()
 
   $ouList = $OUs.GetEnumerator() | ForEach-Object { $_.Value }
+  $ouIndex = 0; $ouTotal = $ouList.Count
 
   foreach ($OU in $ouList) {
+    $ouIndex++
+    Write-Status ("Scanning OU ({0}/{1}): {2}" -f $ouIndex, $ouTotal, $OU)
+
     try { [void](Get-ADOrganizationalUnit -Identity $OU -ErrorAction Stop) }
     catch { Write-Wrn ("OU not found or inaccessible: {0}" -f $OU); continue }
 
     $users = Get-ADUser -Filter 'Enabled -eq $true' -SearchBase $OU -SearchScope Subtree `
              -Properties SamAccountName,UserPrincipalName,mail,Company,Title
 
+    $uIndex = 0; $uTotal = ($users | Measure-Object).Count
     foreach ($u in $users) {
+      $uIndex++
+      if ($uTotal -gt 0) { Show-Progress -Activity "Step 3: $OU" -Status "$uIndex of $uTotal" -Percent ([int](100*$uIndex/$uTotal)) }
+
       $id        = $u.SamAccountName
       $company   = [string]$u.Company
       $title     = [string]$u.Title
       $isStudent = ($title -and $title -ieq 'Student')
 
+      # Policy gate
       $intendedRemote =
         ($company -ieq 'SMCC') -or
         ($company -ieq 'SCS')  -or
         ( ($company -ieq 'CUSSD') -and (-not $isStudent) )
 
       if (-not $intendedRemote) {
+        if ($VerboseMode) { Write-Info ("Skip (policy): {0} [{1}/{2}]" -f $id,$company,$title) }
         $Skipped += [pscustomobject]@{ Sam=$id; Company=$company; Title=$title; Reason='PolicySkip' }
         continue
       }
 
+      # State
       $hasLocal  = $false; $hasRemote = $false
       try { $hasLocal  = [bool](Get-E2016Mailbox       -Identity $id -ErrorAction Stop) } catch {}
       try { $hasRemote = [bool](Get-E2016RemoteMailbox -Identity $id -ErrorAction Stop) } catch {}
+
       if ($hasRemote) {
+        if ($VerboseMode) { Write-Info ("Already Remote: {0}" -f $id) }
         $Skipped += [pscustomobject]@{ Sam=$id; Company=$company; Title=$title; Reason='AlreadyRemote' }
         continue
       }
 
+      # Addressing
       $addr = Get-PlannedAddresses -Sam $id -Company $company
       if ($addr.UsedFallback) { $UsedFallback += [pscustomobject]@{ Sam=$id; Company=$company; Primary=$addr.Primary } }
 
+      # Apply
       try {
         if ($hasLocal) {
-          Write-Host ("ConvertLocalToRemote: {0} ({1}) Primary={2} Remote={3}" -f $id,$company,$addr.Primary,$addr.Remote) -ForegroundColor Yellow
+          Write-Status ("Convert Local->Remote: {0} ({1})" -f $id,$company)
           if ($ApplyChanges) {
             Disable-E2016Mailbox       -Identity $id -Confirm:$false
             Enable-E2016RemoteMailbox  -Identity $id -RemoteRoutingAddress $addr.Remote -PrimarySmtpAddress $addr.Primary
@@ -227,7 +253,7 @@ function Step-3_HybridMailboxes {
           }
           $Converted += [pscustomobject]@{ Sam=$id; Company=$company; Primary=$addr.Primary; Remote=$addr.Remote }
         } else {
-          Write-Host ("EnableRemoteMailbox : {0} ({1}) Primary={2} Remote={3}" -f $id,$company,$addr.Primary,$addr.Remote) -ForegroundColor Cyan
+          Write-Status ("Enable Remote: {0} ({1})" -f $id,$company)
           if ($ApplyChanges) {
             Enable-E2016RemoteMailbox  -Identity $id -RemoteRoutingAddress $addr.Remote -PrimarySmtpAddress $addr.Primary
             Set-E2016RemoteMailbox     -Identity $id -EmailAddressPolicyEnabled:$false
@@ -239,9 +265,10 @@ function Step-3_HybridMailboxes {
         Write-Wrn ("FAILED for {0}: {1}" -f $id, $_.Exception.Message)
       }
     }
+    Show-Progress -Activity "Step 3: $OU" -Status "Complete" -Percent 100
   }
 
-  # Step-scoped summary (also used by final summary)
+  # Return a summary object for final reporting
   [pscustomobject]@{
     Step          = 3
     Converted     = $Converted
@@ -252,52 +279,49 @@ function Step-3_HybridMailboxes {
   }
 }
 
+# ==============================
+# STEP 4 — USAGE LOCATION (Graph)
+# ==============================
 function Step-4_UsageLocation {
-  <#
-    Set usageLocation = "US" for enabled MEMBER users in Entra ID.
-    Uses Graph app-only; filters locally to avoid unsupported $filter operators.
-  #>
-  Write-Note "STEP 4: Normalize usageLocation = 'US'…"
-
+  Write-Status "STEP 4: Normalize usageLocation = 'US'…"
+  # Pull enabled members then filter locally (Graph $filter 'ne'/'null' not supported for usageLocation)
   $allUsers = Get-MgUser -All -Filter "userType eq 'Member' and accountEnabled eq true" `
                -Property id,displayName,userPrincipalName,usageLocation,userType,accountEnabled
 
   $targets = $allUsers | Where-Object { ($_.usageLocation -ne 'US') -or (-not $_.usageLocation) }
 
   $updated = @(); $failed = @()
-  if (-not $targets -or $targets.Count -eq 0) {
-    Write-Ok "No users require usageLocation updates."
-  } else {
-    Write-Host ("Users requiring usageLocation='US': {0}" -f $targets.Count) -ForegroundColor Yellow
-    foreach ($u in $targets) {
-      if ($ApplyChanges) {
-        try {
-          Update-MgUser -UserId $u.Id -UsageLocation "US"
-          $updated += [pscustomobject]@{ Id=$u.Id; UPN=$u.UserPrincipalName; Was=$u.usageLocation; Now='US' }
-        } catch {
-          $failed += [pscustomobject]@{ Id=$u.Id; UPN=$u.UserPrincipalName; Error=$_.Exception.Message }
-        }
-      } else {
-        Write-Host ("PREVIEW  [{0}] {1} (current: {2})" -f $u.Id, $u.UserPrincipalName, ($u.usageLocation ?? '<null>')) -ForegroundColor DarkYellow
+  $i = 0; $n = ($targets | Measure-Object).Count
+  foreach ($u in $targets) {
+    $i++
+    if ($n -gt 0) { Show-Progress -Activity "Step 4: Set usageLocation" -Status "$i of $n" -Percent ([int](100*$i/$n)) }
+    if ($ApplyChanges) {
+      try {
+        Update-MgUser -UserId $u.Id -UsageLocation "US"
+        if ($VerboseMode) { Write-Info ("Updated usageLocation: {0} ({1}->{2})" -f $u.UserPrincipalName,$u.usageLocation,'US') }
+        $updated += [pscustomobject]@{ Id=$u.Id; UPN=$u.UserPrincipalName; Was=$u.usageLocation; Now='US' }
+      } catch {
+        $failed += [pscustomobject]@{ Id=$u.Id; UPN=$u.UserPrincipalName; Error=$_.Exception.Message }
+        Write-Wrn ("FAILED usageLocation for {0}: {1}" -f $u.UserPrincipalName, $_.Exception.Message)
       }
+    } else {
+      if ($VerboseMode) { Write-Info ("PREVIEW usageLocation: {0} (current {1})" -f $u.UserPrincipalName, ($u.usageLocation ?? '<null>')) }
     }
   }
+  Show-Progress -Activity "Step 4: Set usageLocation" -Status "Complete" -Percent 100
 
   [pscustomobject]@{
     Step     = 4
     Updated  = $updated
     Failed   = $failed
-    Count    = ($targets | Measure-Object).Count
+    Count    = $n
   }
 }
 
-# --- Placeholders for future steps ---
-function Step-5_Licensing { <# define license SKU + plan sets per org; apply later #> }
-function Step-6_CustomAttributes { <# CUSSD students/staff attribute stamping #> }
-
 # ==============================
-# 3) MAIN EXECUTION FLOW
+# MAIN EXECUTION FLOW
 # ==============================
+Write-Status "Initializing…"
 Ensure-Modules
 Connect-ExchangeOnPrem
 Connect-GraphAppOnly
@@ -305,16 +329,18 @@ Connect-GraphAppOnly
 # Step 2 – AD hygiene
 Step-2_ADHygiene
 
-# Step 3 – Hybrid mailboxes (returns a summary object)
+# Step 3 – Hybrid mailboxes (summary object)
 $S3 = Step-3_HybridMailboxes
 
-# Step 4 – UsageLocation (returns a summary object)
+# Step 4 – UsageLocation (summary object)
 $S4 = Step-4_UsageLocation
 
 # ==============================
-# 4) FINAL SUMMARY
+# FINAL SUMMARY
 # ==============================
 Write-Host "`n================ RUN SUMMARY ================" -ForegroundColor Cyan
+"ApplyChanges            : {0}" -f $ApplyChanges
+"VerboseMode             : {0}" -f $VerboseMode
 
 # Step 3
 "Step 3 – Converted (Local->Remote): {0}" -f ($S3.Converted.Count)
@@ -323,8 +349,8 @@ Write-Host "`n================ RUN SUMMARY ================" -ForegroundColor Cy
 "Step 3 – Used .invalid fallback   : {0}" -f ($S3.UsedFallback.Count)
 "Step 3 – Failures                 : {0}" -f ($S3.Failures.Count)
 
-# Optional: print details only if nonzero
-if ($S3.UsedFallback.Count -gt 0) { "`n-- Step 3: Used .invalid fallback --"; $S3.UsedFallback | Sort-Object Sam | Format-Table -AutoSize }
+# Optionally print details only when verbose or on failures/fallbacks
+if ($VerboseMode -and $S3.UsedFallback.Count -gt 0) { "`n-- Step 3: Used .invalid fallback --"; $S3.UsedFallback | Sort-Object Sam | Format-Table -AutoSize }
 if ($S3.Failures.Count -gt 0)     { "`n-- Step 3: Failures --"; $S3.Failures | Sort-Object Sam | Format-Table -AutoSize }
 
 # Step 4
@@ -336,6 +362,4 @@ if ($ApplyChanges) {
 } else {
   "Step 4 – Dry-run: no changes applied."
 }
-
 Write-Host "=============================================" -ForegroundColor Cyan
-if (-not $ApplyChanges) { Write-Wrn "NOTE: ApplyChanges = `$false (dry run). Set `$ApplyChanges = `$true to apply changes." }
