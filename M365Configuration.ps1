@@ -1,8 +1,8 @@
 <#
 M365Automation.ps1
 Author: Richard
-Version: 0.6.0
-Updated: 2025-09-20
+Version: 0.6.1
+Updated: 2025-09-23
 
 Structure
   Step 1 – Setup (user toggles, relative paths, connections, helpers)
@@ -30,15 +30,17 @@ Notes
 
 # ---- Toggles (user-editable) ----
 $ApplyChanges = $false      # $true to apply, $false = preview only
-$VerboseMode  = $true      # $true = verbose logs, $false = progress + summary
+$VerboseMode  = $true       # $true = verbose logs, $false = progress + summary
 
 # ---- Resolve relative paths ----
 $ScriptDir    = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $KeyPath      = Join-Path $ScriptDir "AES.key"
 $CredPath     = Join-Path $ScriptDir "OnPremCred.xml"
 $PfxPath      = Join-Path $ScriptDir "GraphApp.pfx"
-$PfxPass    = ConvertTo-SecureString "P@ssw0rd" -AsPlainText -Force
 $PfxPassPath  = Join-Path $ScriptDir "PfxPass.xml"
+
+# Optional fallback: literal PFX password (only used if PfxPass.xml not present)
+$PfxPass      = ConvertTo-SecureString "P@ssw0rd" -AsPlainText -Force
 
 # ---- Tenant / App / Cert ----
 $TenantId             = "3dcf5cc9-81b0-4bb3-8098-64ec361b3fbc"
@@ -63,7 +65,7 @@ $PrimaryDomainByCompany = @{
   'CUSSD' = 'christianunified.org'
 }
 $RemoteRoutingSuffix   = ($TenantInitialDomain -replace 'onmicrosoft.com$','mail.onmicrosoft.com')
-$FallbackPrimaryDomain = 'nonroutable.invalid'
+$FallbackPrimaryDomain = 'nonroutable.invalid'  # deliberate so failures are obvious
 
 # ---- Licensing ----
 $LicenseSkuParts = @{
@@ -113,6 +115,7 @@ $OnPremCred = New-Object System.Management.Automation.PSCredential ($credBlob.Us
 # CONNECTIONS / MODULES
 # ==============================
 function Ensure-Modules {
+  Write-Status "Step 1.1: Ensuring required modules are present…"
   $mods = @('ActiveDirectory','Microsoft.Graph','ExchangeOnlineManagement')
   foreach ($m in $mods) {
     if (-not (Get-Module -ListAvailable -Name $m)) {
@@ -134,12 +137,18 @@ function Connect-ExchangeOnPrem {
   Write-Ok "Exchange on-prem connected."
 }
 
-# helper for encrypted securestring
+# ===== Helpers for cert/password handling =====
 function Get-EncryptedSecureString {
   param([Parameter(Mandatory)][string]$SecretPath,[Parameter(Mandatory)][string]$KeyPath)
-  $key  = Import-Clixml $KeyPath
-  $blob = Import-Clixml $SecretPath
-  return (ConvertTo-SecureString $blob.EncPwd -Key $key)
+  $k  = Import-Clixml $KeyPath
+  $b  = Import-Clixml $SecretPath
+  return (ConvertTo-SecureString $b.EncPwd -Key $k)
+}
+function Get-PlainText {
+  param([Parameter(Mandatory)][System.Security.SecureString]$Secure)
+  $ptr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($Secure)
+  try { [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr) }
+  finally { if ($ptr -ne [IntPtr]::Zero) { [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr) } }
 }
 
 function Connect-GraphAppOnly {
@@ -150,12 +159,24 @@ function Connect-GraphAppOnly {
       Connect-MgGraph -TenantId $TenantId -ClientId $AppId -CertificateThumbprint $Thumbprint | Out-Null
     }
     'PfxFile' {
-      $pfxSecure = Get-EncryptedSecureString -SecretPath $PfxPassPath -KeyPath $KeyPath
-      $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2
-      $flags = [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable
-      $cert.Import($PfxPath, $PfxPass, $flags)
+      if (-not (Test-Path $PfxPath)) { throw "PFX not found at $PfxPath" }
+
+      # Prefer encrypted PfxPass.xml; else fall back to $PfxPass variable
+      $pfxSecure =
+        if (Test-Path $PfxPassPath) { Get-EncryptedSecureString -SecretPath $PfxPassPath -KeyPath $KeyPath }
+        else {
+          if (-not $PfxPass) { throw "No PFX password available. Set `$PfxPass or create $PfxPassPath." }
+          $PfxPass
+        }
+
+      # PS7/.NET: use constructor with plaintext password (required)
+      $pfxPlain = Get-PlainText -Secure $pfxSecure
+      $flags    = [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable
+      $cert     = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($PfxPath, $pfxPlain, $flags)
+
       Connect-MgGraph -TenantId $TenantId -ClientId $AppId -Certificate $cert | Out-Null
     }
+    default { throw "CertMode must be 'PfxFile' or 'Thumbprint'." }
   }
   Write-Ok "Graph connected."
 }
@@ -165,7 +186,13 @@ function Connect-ExchangeOnlineApp {
   if ($CertMode -eq 'Thumbprint') {
     Connect-ExchangeOnline -AppId $AppId -CertificateThumbprint $Thumbprint -Organization $TenantInitialDomain -ShowBanner:$false | Out-Null
   } else {
-    $pfxSecure = Get-EncryptedSecureString -SecretPath $PfxPassPath -KeyPath $KeyPath
+    if (-not (Test-Path $PfxPath)) { throw "PFX not found at $PfxPath" }
+    $pfxSecure =
+      if (Test-Path $PfxPassPath) { Get-EncryptedSecureString -SecretPath $PfxPassPath -KeyPath $KeyPath }
+      else {
+        if (-not $PfxPass) { throw "No PFX password available. Set `$PfxPass or create $PfxPassPath." }
+        $PfxPass
+      }
     Connect-ExchangeOnline `
       -AppId $AppId `
       -CertificateFilePath $PfxPath `
@@ -177,35 +204,299 @@ function Connect-ExchangeOnlineApp {
 }
 
 # ==============================
-# HELPERS (unchanged logic)
+# HELPERS (addressing, Graph lookups)
 # ==============================
-function Get-PlannedAddresses { … }     # << keep your full address-building helper
-function Escape-ODataLiteral { … }
-function Resolve-CloudUserByUPN { … }
+function Get-PlannedAddresses {
+  param([Parameter(Mandatory)][string]$Sam,[Parameter(Mandatory)][string]$Company)
+  $alias = $Sam
+  if ($PrimaryDomainByCompany.ContainsKey($Company)) {
+    $primary = "$alias@$($PrimaryDomainByCompany[$Company])"; $usedFallback = $false
+  } else {
+    $primary = "$alias@$FallbackPrimaryDomain"; $usedFallback = $true
+  }
+  $remote = "$alias@$RemoteRoutingSuffix"
+  [pscustomobject]@{ Primary=$primary; Remote=$remote; UsedFallback=$usedFallback }
+}
+function Escape-ODataLiteral { param([string]$Value) return ($Value -replace "'", "''") }
+function Resolve-CloudUserByUPN {
+  param([string]$UPN,[string[]]$SelectProps=@('id','userPrincipalName','usageLocation','assignedLicenses'))
+  if ([string]::IsNullOrWhiteSpace($UPN)) { return $null }
+  $escaped = Escape-ODataLiteral -Value $UPN
+  try {
+    $u = Get-MgUser -Filter "userPrincipalName eq '$escaped'" -Property $SelectProps -ErrorAction Stop
+    if ($u) { return $u }
+  } catch {}
+  try {
+    $u = Get-MgUser -Search ('"'+$UPN+'"') -ConsistencyLevel eventual -Property $SelectProps |
+         Where-Object { $_.UserPrincipalName -ieq $UPN } | Select-Object -First 1
+    return $u
+  } catch { return $null }
+}
 
 # ==============================
 # STEP 2 — AD ATTRIBUTES
 # ==============================
-function Step-2a_ADHygiene { … }
-function Step-2b_CUSSDStaff { … }
-function Step-2c_CUSSDStudents { … }
+function Step-2a_ADHygiene {
+  Write-Status "STEP 2a: AD hygiene (adminDescription)…"
+  $enabled  = Get-ADUser -Filter 'Enabled -eq $true'  -Properties adminDescription,SamAccountName
+  $disabled = Get-ADUser -Filter 'Enabled -eq $false' -Properties adminDescription,SamAccountName
+
+  foreach ($u in $enabled) {
+    if ($u.adminDescription) {
+      if ($VerboseMode) { Write-Info ("Clearing adminDescription: {0}" -f $u.SamAccountName) }
+      if ($ApplyChanges) { Set-ADUser $u -Clear adminDescription }
+    }
+  }
+  foreach ($u in $disabled) {
+    if ($u.adminDescription -ne 'User_NoSync') {
+      if ($VerboseMode) { Write-Info ("Setting adminDescription=User_NoSync: {0}" -f $u.SamAccountName) }
+      if ($ApplyChanges) { Set-ADUser $u -Replace @{adminDescription='User_NoSync'} }
+    }
+  }
+  Write-Ok "STEP 2a complete."
+}
+
+function Step-2b_CUSSDStaff {
+  Write-Status "STEP 2b: CUSSD Staff EmployeeNumber…"
+  $users = Get-ADUser -SearchBase $OUs.CUSSDStaff -Filter * -Properties SamAccountName,EmployeeNumber
+  foreach ($u in $users) {
+    $empNum = "$($u.SamAccountName)@christianunified.org"
+    if ($u.EmployeeNumber -ne $empNum) {
+      if ($VerboseMode) { Write-Info ("Set EmployeeNumber for {0} -> {1}" -f $u.SamAccountName,$empNum) }
+      if ($ApplyChanges) { Set-ADUser $u -EmployeeNumber $empNum }
+    }
+  }
+  Write-Ok "STEP 2b complete."
+}
+
+function Step-2c_CUSSDStudents {
+  Write-Status "STEP 2c: CUSSD Students (mail/UPN/EmployeeNumber)…"
+  $users = Get-ADUser -SearchBase $OUs.CUSSDStudents -Filter * -Properties SamAccountName,UserPrincipalName,mail,EmployeeNumber
+  foreach ($u in $users) {
+    $email  = "$($u.SamAccountName)@christianunified.org"
+    $empNum = "$($u.SamAccountName)@g.christianunified.org"
+    $needs  = ($u.mail -ne $email) -or ($u.UserPrincipalName -ne $email) -or ($u.EmployeeNumber -ne $empNum)
+    if ($needs) {
+      if ($VerboseMode) { Write-Info ("Stamp student {0} -> mail/UPN={1}; EmployeeNumber={2}" -f $u.SamAccountName,$email,$empNum) }
+      if ($ApplyChanges) { Set-ADUser -Identity $u -EmailAddress $email -EmployeeNumber $empNum -UserPrincipalName $email }
+    }
+  }
+  Write-Ok "STEP 2c complete."
+}
 
 # ==============================
 # STEP 3 — REMOTE MAILBOXES
 # ==============================
-function Step-3_RemoteMailboxes { … }
+function Step-3_RemoteMailboxes {
+  Write-Status "STEP 3: Hybrid mailbox handling…"
+  $Converted    = @()
+  $EnabledNew   = @()
+  $Skipped      = @()
+  $Failures     = @()
+  $UsedFallback = @()
+
+  $ouList = $OUs.GetEnumerator() | ForEach-Object { $_.Value }
+  foreach ($OU in $ouList) {
+    try { [void](Get-ADOrganizationalUnit -Identity $OU -ErrorAction Stop) } catch { Write-Wrn "OU inaccessible: $OU"; continue }
+
+    $users = Get-ADUser -Filter 'Enabled -eq $true' -SearchBase $OU -SearchScope Subtree `
+             -Properties SamAccountName,UserPrincipalName,Company,Title
+    foreach ($u in $users) {
+      $id        = $u.SamAccountName
+      $company   = [string]$u.Company
+      $title     = [string]$u.Title
+      $isStudent = ($title -and $title -ieq 'Student')
+
+      # Policy: RemoteMailbox for SMCC & SCS; CUSSD employees only (students excluded)
+      $intendedRemote = ($company -ieq 'SMCC') -or ($company -ieq 'SCS') -or ( ($company -ieq 'CUSSD') -and (-not $isStudent) )
+      if (-not $intendedRemote) { $Skipped += [pscustomobject]@{Sam=$id;Why='PolicySkip'}; continue }
+
+      $hasLocal  = $false; $hasRemote = $false
+      try { $hasLocal  = [bool](Get-E2016Mailbox       -Identity $id -ErrorAction Stop) } catch {}
+      try { $hasRemote = [bool](Get-E2016RemoteMailbox -Identity $id -ErrorAction Stop) } catch {}
+
+      if ($hasRemote) { $Skipped += [pscustomobject]@{Sam=$id;Why='AlreadyRemote'}; continue }
+
+      $addr = Get-PlannedAddresses -Sam $id -Company $company
+      if ($addr.UsedFallback) { $UsedFallback += [pscustomobject]@{Sam=$id;Primary=$addr.Primary} }
+
+      try {
+        if ($hasLocal) {
+          Write-Status "Convert Local->Remote: $id"
+          if ($ApplyChanges) {
+            Disable-E2016Mailbox       -Identity $id -Confirm:$false
+            Enable-E2016RemoteMailbox  -Identity $id -RemoteRoutingAddress $addr.Remote -PrimarySmtpAddress $addr.Primary
+            Set-E2016RemoteMailbox     -Identity $id -EmailAddressPolicyEnabled:$false
+          }
+          $Converted += [pscustomobject]@{Sam=$id;Primary=$addr.Primary;Remote=$addr.Remote}
+        } else {
+          Write-Status "Enable Remote: $id"
+          if ($ApplyChanges) {
+            Enable-E2016RemoteMailbox  -Identity $id -RemoteRoutingAddress $addr.Remote -PrimarySmtpAddress $addr.Primary
+            Set-E2016RemoteMailbox     -Identity $id -EmailAddressPolicyEnabled:$false
+          }
+          $EnabledNew += [pscustomobject]@{Sam=$id;Primary=$addr.Primary;Remote=$addr.Remote}
+        }
+      } catch {
+        $Failures += [pscustomobject]@{Sam=$id;Error=$_.Exception.Message}
+        Write-Wrn ("FAILED for {0}: {1}" -f $id, $_.Exception.Message)
+      }
+    }
+  }
+
+  # Return summary object
+  [pscustomobject]@{
+    Converted    = $Converted
+    EnabledNew   = $EnabledNew
+    Skipped      = $Skipped
+    Failures     = $Failures
+    UsedFallback = $UsedFallback
+  }
+}
 
 # ==============================
 # STEP 4 — ADSYNC
 # ==============================
-function Step-4_ADSync { … }
+function Step-4_ADSync {
+  Write-Status "STEP 4: Trigger ADSync on AADC, then wait 120s…"
+  try {
+    Invoke-Command -ComputerName AADC -Credential $OnPremCred -ScriptBlock { Start-ADSyncSyncCycle }
+    timeout 120
+    Write-Ok "STEP 4 complete."
+  } catch {
+    Write-Wrn ("ADSync trigger failed: {0}" -f $_.Exception.Message)
+  }
+}
 
 # ==============================
 # STEP 5 — CLOUD
 # ==============================
-function Step-5a_UsageLocation { … }
-function Step-5bcd_Licensing { … }
-function Step-5e_CloudMailboxPermissions { … }
+function Step-5a_UsageLocation {
+  Write-Status "STEP 5a: Ensure usageLocation = 'US'…"
+  $allUsers = Get-MgUser -All -Filter "userType eq 'Member' and accountEnabled eq true" `
+               -Property id,userPrincipalName,usageLocation
+  $targets = $allUsers | Where-Object { ($_.usageLocation -ne 'US') -or (-not $_.usageLocation) }
+  $i = 0; $n = ($targets | Measure-Object).Count
+  foreach ($u in $targets) {
+    $i++; if ($n -gt 0) { Show-Progress -Activity "Step 5a" -Status "$i of $n" -Percent ([int](100*$i/$n)) }
+    if ($ApplyChanges) { Update-MgUser -UserId $u.Id -UsageLocation "US" }
+    else { Write-Info ("Would set usageLocation for {0}" -f $u.UserPrincipalName) }
+  }
+  Show-Progress -Activity "Step 5a" -Status "Complete" -Percent 100
+  Write-Ok "STEP 5a complete."
+}
+
+function Step-5bcd_Licensing {
+  Write-Status "STEP 5b/5c/5d: Licensing…"
+
+  $allSkus = Get-MgSubscribedSku -All
+  function New-LicensePayload {
+    param([string]$SkuPart,[string[]]$DisabledNames)
+    $sku = $allSkus | Where-Object SkuPartNumber -eq $SkuPart
+    if (-not $sku) { throw "SKU '$SkuPart' not found in tenant." }
+    $ids = @()
+    if ($DisabledNames -and $DisabledNames.Count -gt 0) {
+      $ids = $sku.ServicePlans | Where-Object { $_.ServicePlanName -in $DisabledNames } | Select-Object -ExpandProperty ServicePlanId
+    }
+    return @{ SkuId = $sku.SkuId; DisabledPlans = $ids }
+  }
+
+  $License_Staff        = New-LicensePayload -SkuPart $LicenseSkuParts.Staff        -DisabledNames $LicenseDisabledPlans.Staff
+  $License_CUSSDStudent = New-LicensePayload -SkuPart $LicenseSkuParts.CUSSDStudent -DisabledNames $LicenseDisabledPlans.CUSSDStudent
+  $License_SCSStudent   = New-LicensePayload -SkuPart $LicenseSkuParts.SCSStudent   -DisabledNames $LicenseDisabledPlans.SCSStudent
+
+  $results = @{ Added=@(); UpdatedMask=@(); NoChange=@(); SkippedUsageLoc=@(); Failed=@() }
+
+  # Map OUs to intended license payload
+  $map = @{
+    Staff        = @($OUs.SMCCStaff,$OUs.SCSStaff,$OUs.CUSSDStaff), $License_Staff
+    CUSSDStudent = @($OUs.CUSSDStudents),                           $License_CUSSDStudent
+    SCSStudent   = @($OUs.SCSStudents),                             $License_SCSStudent
+  }
+
+  foreach ($entry in $map.GetEnumerator()) {
+    $payload = $entry.Value[1]
+    $ouList  = $entry.Value[0]
+    foreach ($ou in $ouList) {
+      try { [void](Get-ADOrganizationalUnit -Identity $ou -ErrorAction Stop) } catch { Write-Wrn "OU inaccessible: $ou"; continue }
+      $adUsers = Get-ADUser -Filter 'Enabled -eq $true' -SearchBase $ou -SearchScope Subtree -Properties UserPrincipalName,SamAccountName
+      foreach ($ad in $adUsers) {
+        Write-Status ("Licensing target: {0}  ({1})" -f $ad.UserPrincipalName,$entry.Key)
+        $cloud = Resolve-CloudUserByUPN -UPN $ad.UserPrincipalName -SelectProps @('id','userPrincipalName','usageLocation','assignedLicenses')
+        if (-not $cloud) { Write-Wrn ("Cloud user not found: {0}" -f $ad.UserPrincipalName); continue }
+
+        # Must have usageLocation US (5a should have set it)
+        if ($cloud.usageLocation -ne 'US') { $results.SkippedUsageLoc += $ad.UserPrincipalName; continue }
+
+        # Determine if already has SKU + correct mask
+        $targetSku = [Guid]$payload.SkuId
+        $hasTarget = $false; $curDisabled = @()
+        foreach ($al in $cloud.AssignedLicenses) {
+          if ($al.SkuId -eq $targetSku) { $hasTarget = $true; if ($al.DisabledPlans){$curDisabled=[Guid[]]$al.DisabledPlans}; break }
+        }
+        $proposedDisabled = @()
+        if ($payload.DisabledPlans) { $proposedDisabled = [Guid[]]$payload.DisabledPlans }
+
+        if (-not $hasTarget) {
+          $add = @(@{ SkuId=$targetSku; DisabledPlans=$proposedDisabled })
+          if ($ApplyChanges) {
+            try { Set-MgUserLicense -UserId $cloud.Id -AddLicenses $add -RemoveLicenses @(); $results.Added += $ad.UserPrincipalName }
+            catch { Write-Wrn ("License add failed for {0}: {1}" -f $ad.UserPrincipalName,$_.Exception.Message); $results.Failed += $ad.UserPrincipalName }
+          } else { $results.Added += $ad.UserPrincipalName }
+        } else {
+          $needsUpdate = ($proposedDisabled.Count -ne $curDisabled.Count) -or
+                         (@(Compare-Object -ReferenceObject $proposedDisabled -DifferenceObject $curDisabled -SyncWindow 0).Count -gt 0)
+          if ($needsUpdate) {
+            $add = @(@{ SkuId=$targetSku; DisabledPlans=$proposedDisabled })
+            if ($ApplyChanges) {
+              try { Set-MgUserLicense -UserId $cloud.Id -AddLicenses $add -RemoveLicenses @(); $results.UpdatedMask += $ad.UserPrincipalName }
+              catch { Write-Wrn ("License mask update failed for {0}: {1}" -f $ad.UserPrincipalName,$_.Exception.Message); $results.Failed += $ad.UserPrincipalName }
+            } else { $results.UpdatedMask += $ad.UserPrincipalName }
+          } else {
+            $results.NoChange += $ad.UserPrincipalName
+          }
+        }
+      }
+    }
+  }
+
+  # Return results
+  [pscustomobject]@{
+    Added           = $results.Added
+    UpdatedMask     = $results.UpdatedMask
+    NoChange        = $results.NoChange
+    SkippedUsageLoc = $results.SkippedUsageLoc
+    Failed          = $results.Failed
+  }
+}
+
+function Step-5e_CloudMailboxPermissions {
+  Write-Status "STEP 5e: Ensure 'Exchange Mailbox Administrators' has FullAccess on all cloud mailboxes…"
+  try {
+    Connect-ExchangeOnlineApp
+    $mailboxes = Get-ExoMailbox -ResultSize Unlimited
+    $i=0; $n=($mailboxes | Measure-Object).Count
+    foreach ($mb in $mailboxes) {
+      $i++; if ($n -gt 0) { Show-Progress -Activity "Step 5e" -Status "$i of $n" -Percent ([int](100*$i/$n)) }
+      $perm = Get-ExoMailboxPermission -Identity $mb.UserPrincipalName -User "Exchange Mailbox Administrators" -ErrorAction SilentlyContinue
+      if (-not $perm) {
+        if ($VerboseMode) { Write-Info ("Adding FullAccess for {0}" -f $mb.UserPrincipalName) }
+        if ($ApplyChanges) {
+          Add-ExoMailboxPermission -Identity $mb.UserPrincipalName -User "Exchange Mailbox Administrators" -AccessRights FullAccess -AutoMapping:$false -Confirm:$false
+        }
+      } else {
+        if ($VerboseMode) { Write-Note ("Already granted: {0}" -f $mb.UserPrincipalName) }
+      }
+    }
+    Show-Progress -Activity "Step 5e" -Status "Complete" -Percent 100
+    Write-Ok "STEP 5e complete."
+  } catch {
+    Write-Err ("Step 5e failed: {0}" -f $_.Exception.Message)
+  } finally {
+    # Optionally disconnect EXO:
+    # Disconnect-ExchangeOnline -Confirm:$false
+  }
+}
 
 # ==============================
 # MAIN
@@ -215,18 +506,44 @@ Ensure-Modules
 Connect-ExchangeOnPrem
 Connect-GraphAppOnly
 
+# Step 2 — AD attributes (uncomment to run)
 #Step-2a_ADHygiene
 #Step-2b_CUSSDStaff
 #Step-2c_CUSSDStudents
+
+# Step 3 — Remote mailboxes (uncomment to run)
 #$S3 = Step-3_RemoteMailboxes
+
+# Step 4 — ADSync (uncomment to run)
 #Step-4_ADSync
+
+# Step 5 — Cloud (uncomment pieces to run)
 #Step-5a_UsageLocation
 #$S5 = Step-5bcd_Licensing
 #Step-5e_CloudMailboxPermissions
 
+# ==============================
+# FINAL SUMMARY
+# ==============================
 Write-Host "`n================ RUN SUMMARY ================" -ForegroundColor Cyan
 "ApplyChanges : {0}" -f $ApplyChanges
 "VerboseMode  : {0}" -f $VerboseMode
-# …summary printing…
+
+if ($S3) {
+  "Step 3 – Converted Local->Remote : {0}" -f ($S3.Converted.Count)
+  "Step 3 – Enabled  None->Remote   : {0}" -f ($S3.EnabledNew.Count)
+  "Step 3 – Skipped                 : {0}" -f ($S3.Skipped.Count)
+  "Step 3 – Failures                : {0}" -f ($S3.Failures.Count)
+  if ($VerboseMode -and $S3.UsedFallback.Count -gt 0) { "`n-- Step 3: Used .invalid fallback --"; $S3.UsedFallback | Sort-Object Sam | Format-Table -AutoSize }
+}
+
+if ($S5) {
+  "Step 5 – Added licenses         : {0}" -f ($S5.Added.Count)
+  "Step 5 – Updated license masks  : {0}" -f ($S5.UpdatedMask.Count)
+  "Step 5 – No change              : {0}" -f ($S5.NoChange.Count)
+  "Step 5 – Skipped (usageLocation): {0}" -f ($S5.SkippedUsageLoc.Count)
+  "Step 5 – Failed                 : {0}" -f ($S5.Failed.Count)
+}
+
 Write-Host "=============================================" -ForegroundColor Cyan
-if (-not $ApplyChanges) { Write-Wrn "NOTE: ApplyChanges = `$false (dry run)." }
+if (-not $ApplyChanges) { Write-Wrn "NOTE: ApplyChanges = `$false (dry run). Set `$ApplyChanges = `$true to apply changes." }
