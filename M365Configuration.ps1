@@ -27,7 +27,7 @@ Notes
 # ==============================
 
 # ---- Toggles (user-editable) ----
-$ApplyChanges         = $false     # $true to apply, $false = preview only
+$ApplyChanges         = $true     # $true to apply, $false = preview only
 $VerboseMode          = $false     # $true = verbose logs, $false = progress + summary
 $PermFastMode         = $true      # Step 5e: $true = try-add & catch duplicate; $false = check-then-add
 $EnforceAddressPolicy = $true      # Keep all mailboxes on Email Address Policy (Step 3)
@@ -228,12 +228,22 @@ function Resolve-CloudUserByUPN {
   } catch { return $null }
 }
 
-# Utility: null-safe comparison for plan masks
+# Utility: null-safe, type-safe comparison for plan masks
 function Test-PlanMaskChanged {
-  param([Guid[]]$Proposed, [Guid[]]$Current)
-  $pd = if ($Proposed) { [Guid[]]$Proposed } else { @() }
-  $cd = if ($Current)  { [Guid[]]$Current  } else { @() }
-  return ($pd.Count -ne $cd.Count) -or ((Compare-Object -ReferenceObject $pd -DifferenceObject $cd | Select-Object -First 1) -ne $null)
+  param($Proposed, $Current)
+
+  # Force arrays and normalize to strings
+  $pd = @()
+  if ($null -ne $Proposed) { $pd = @($Proposed | ForEach-Object { $_.ToString() }) }
+
+  $cd = @()
+  if ($null -ne $Current)  { $cd = @($Current  | ForEach-Object { $_.ToString() }) }
+
+  # Quick count check first
+  if ($pd.Count -ne $cd.Count) { return $true }
+
+  # Compare-Object now always receives real arrays
+  return ($null -ne (Compare-Object -ReferenceObject $pd -DifferenceObject $cd | Select-Object -First 1))
 }
 
 # ==============================
@@ -394,74 +404,99 @@ function Step-5a_UsageLocation {
 }
 
 function Step-5bcd_Licensing {
-  Write-Status "STEP 5b/5c/5d: Licensing (only logging actions; quiet for no-ops)…"
+  Write-Status "STEP 5b/5c/5d: Licensing (direct SKU lookups)…"
 
-  $allSkus = Get-MgSubscribedSku -All
-  function New-LicensePayload {
-    param([string]$SkuPart,[string[]]$DisabledNames)
-    $sku = $allSkus | Where-Object SkuPartNumber -eq $SkuPart
-    if (-not $sku) { throw "SKU '$SkuPart' not found in tenant." }
-    $ids = @()
+  # Direct, explicit SKU selection (your approach)
+  $StudentsSku = Get-MgSubscribedSku -All | Where-Object SkuPartNumber -eq 'STANDARDWOFFPACK_IW_STUDENT'
+  $StaffSku    = Get-MgSubscribedSku -All | Where-Object SkuPartNumber -eq 'STANDARDWOFFPACK_IW_FACULTY'
+
+  if (-not $StudentsSku) { Write-Err "SKU 'STANDARDWOFFPACK_IW_STUDENT' not found in tenant."; return }
+  if (-not $StaffSku)    { Write-Err "SKU 'STANDARDWOFFPACK_IW_FACULTY' not found in tenant."; return }
+
+  # Helper: build a payload @{ SkuId='<guid-str>'; DisabledPlans='<guid-str>'[] } from a SKU object + plan names
+  function BuildPayloadFromSku {
+    param($SkuObj, [string[]]$DisabledNames)
+    $skuId = $SkuObj.SkuId.ToString()
+    $disabledIds = @()
     if ($DisabledNames -and $DisabledNames.Count -gt 0) {
-      $ids = $sku.ServicePlans | Where-Object { $_.ServicePlanName -in $DisabledNames } | Select-Object -ExpandProperty ServicePlanId
+      # Map only plans that exist for this SKU in THIS tenant
+      $planIdx = @{}
+      foreach ($sp in ($SkuObj.ServicePlans | Where-Object { $_.ServicePlanId })) {
+        $planIdx[$sp.ServicePlanName] = $sp.ServicePlanId.ToString()
+      }
+      foreach ($name in $DisabledNames) {
+        if ($planIdx.ContainsKey($name)) {
+          $disabledIds += $planIdx[$name]
+        } elseif ($VerboseMode) {
+          Write-Note ("Plan '{0}' not present in SKU '{1}' – skipping from DisabledPlans." -f $name, $SkuObj.SkuPartNumber)
+        }
+      }
+      $disabledIds = @($disabledIds | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
     }
-    return @{ SkuId = $sku.SkuId; DisabledPlans = $ids }
+    return @{ SkuId = $skuId; DisabledPlans = $disabledIds }
   }
 
-  $License_Staff        = New-LicensePayload -SkuPart $LicenseSkuParts.Staff        -DisabledNames $LicenseDisabledPlans.Staff
-  $License_CUSSDStudent = New-LicensePayload -SkuPart $LicenseSkuParts.CUSSDStudent -DisabledNames $LicenseDisabledPlans.CUSSDStudent
-  $License_SCSStudent   = New-LicensePayload -SkuPart $LicenseSkuParts.SCSStudent   -DisabledNames $LicenseDisabledPlans.SCSStudent
+  # Build intended payloads
+  $License_CUSSDStudent = BuildPayloadFromSku -SkuObj $StudentsSku -DisabledNames $LicenseDisabledPlans.CUSSDStudent
+  $License_SCSStudent   = BuildPayloadFromSku -SkuObj $StudentsSku -DisabledNames $LicenseDisabledPlans.SCSStudent
+  $License_Staff        = BuildPayloadFromSku -SkuObj $StaffSku    -DisabledNames $LicenseDisabledPlans.Staff
 
   $results = @{ Added=@(); UpdatedMask=@(); NoChange=@(); SkippedUsageLoc=@(); Failed=@() }
 
-  # Map OUs to intended license payload
-  $map = @{
-    Staff        = @($OUs.SMCCStaff,$OUs.SCSStaff,$OUs.CUSSDStaff), $License_Staff
-    CUSSDStudent = @($OUs.CUSSDStudents),                           $License_CUSSDStudent
-    SCSStudent   = @($OUs.SCSStudents),                             $License_SCSStudent
-  }
+  # Map each OU group to its payload
+  $groups = @(
+    @{ Name='Staff';        OUs=@($OUs.SMCCStaff,$OUs.SCSStaff,$OUs.CUSSDStaff); Payload=$License_Staff;        Part='STANDARDWOFFPACK_IW_FACULTY' }
+    @{ Name='CUSSDStudent'; OUs=@($OUs.CUSSDStudents);                           Payload=$License_CUSSDStudent; Part='STANDARDWOFFPACK_IW_STUDENT' }
+    @{ Name='SCSStudent';   OUs=@($OUs.SCSStudents);                             Payload=$License_SCSStudent;   Part='STANDARDWOFFPACK_IW_STUDENT' }
+  )
 
-  foreach ($entry in $map.GetEnumerator()) {
-    $bucket  = $entry.Key
-    $payload = $entry.Value[1]
-    $ouList  = $entry.Value[0]
-
-    foreach ($ou in $ouList) {
+  foreach ($grp in $groups) {
+    foreach ($ou in $grp.OUs) {
       try { [void](Get-ADOrganizationalUnit -Identity $ou -ErrorAction Stop) } catch { Write-Wrn "OU inaccessible: $ou"; continue }
       $adUsers = Get-ADUser -Filter 'Enabled -eq $true' -SearchBase $ou -SearchScope Subtree -Properties UserPrincipalName,SamAccountName
 
       foreach ($ad in $adUsers) {
-        $upn = $ad.UserPrincipalName
+        $upn   = $ad.UserPrincipalName
         $cloud = Resolve-CloudUserByUPN -UPN $upn -SelectProps @('id','userPrincipalName','usageLocation','assignedLicenses')
         if (-not $cloud) { Write-Wrn ("[Licensing] Cloud user not found: {0}" -f $upn); continue }
         if ($cloud.usageLocation -ne 'US') { $results.SkippedUsageLoc += $upn; continue }
 
-        $targetSku = [Guid]$payload.SkuId
+        $targetSkuId      = $grp.Payload.SkuId                   # string GUID
+        $proposedDisabled = @($grp.Payload.DisabledPlans)         # string[] GUIDs (may be empty)
+
+        # Does user already have the SKU? capture current mask
         $hasTarget = $false; $curDisabled = @()
-        foreach ($al in $cloud.AssignedLicenses) {
-          if ($al.SkuId -eq $targetSku) { $hasTarget = $true; if ($al.DisabledPlans){$curDisabled=[Guid[]]$al.DisabledPlans}; break }
+        foreach ($al in ($cloud.AssignedLicenses | Where-Object { $_.SkuId })) {
+          if ($al.SkuId.ToString() -eq $targetSkuId) {
+            $hasTarget = $true
+            if ($al.DisabledPlans) { $curDisabled = @($al.DisabledPlans | ForEach-Object { $_.ToString() }) }
+            break
+          }
         }
-        $proposedDisabled = if ($payload.DisabledPlans) { [Guid[]]$payload.DisabledPlans } else { @() }
 
         if (-not $hasTarget) {
-          $add = @(@{ SkuId=$targetSku; DisabledPlans=$proposedDisabled })
+          $add = @(@{ SkuId=$targetSkuId; DisabledPlans=$proposedDisabled })
           if ($ApplyChanges) {
-            try { Set-MgUserLicense -UserId $cloud.Id -AddLicenses $add -RemoveLicenses @(); $results.Added += $upn; Write-Info ("[ADD] {0} → {1} ({2})" -f $upn, $LicenseSkuParts[$bucket], $bucket) }
+            try { Set-MgUserLicense -UserId $cloud.Id -AddLicenses $add -RemoveLicenses @(); $results.Added += $upn; Write-Info ("[ADD] {0} → {1} ({2})" -f $upn, $grp.Part, $grp.Name) }
             catch { $results.Failed += $upn; Write-Wrn ("[ADD FAIL] {0}: {1}" -f $upn, $_.Exception.Message) }
-          } else { $results.Added += $upn; Write-Info ("[DRY-RUN ADD] {0} → {1} ({2})" -f $upn, $LicenseSkuParts[$bucket], $bucket) }
+          } else {
+            $results.Added += $upn; Write-Info ("[DRY-RUN ADD] {0} → {1} ({2})" -f $upn, $grp.Part, $grp.Name)
+          }
 
         } else {
-          # Null-safe plan mask comparison
+          # Null-safe mask compare (uses your Test-PlanMaskChanged helper)
           $needsUpdate = Test-PlanMaskChanged -Proposed $proposedDisabled -Current $curDisabled
           if ($needsUpdate) {
-            $add = @(@{ SkuId=$targetSku; DisabledPlans=$proposedDisabled })
+            $add = @(@{ SkuId=$targetSkuId; DisabledPlans=$proposedDisabled })
             if ($ApplyChanges) {
-              try { Set-MgUserLicense -UserId $cloud.Id -AddLicenses $add -RemoveLicenses @(); $results.UpdatedMask += $upn; Write-Info ("[MASK UPDATE] {0} → {1} ({2})" -f $upn, $LicenseSkuParts[$bucket], $bucket) }
+              try { Set-MgUserLicense -UserId $cloud.Id -AddLicenses $add -RemoveLicenses @(); $results.UpdatedMask += $upn; Write-Info ("[MASK UPDATE] {0} → {1} ({2})" -f $upn, $grp.Part, $grp.Name) }
               catch { $results.Failed += $upn; Write-Wrn ("[MASK FAIL] {0}: {1}" -f $upn, $_.Exception.Message) }
-            } else { $results.UpdatedMask += $upn; Write-Info ("[DRY-RUN MASK] {0} → {1} ({2})" -f $upn, $LicenseSkuParts[$bucket], $bucket) }
+            } else {
+              $results.UpdatedMask += $upn; Write-Info ("[DRY-RUN MASK] {0} → {1} ({2})" -f $upn, $grp.Part, $grp.Name)
+            }
           } else {
             $results.NoChange += $upn
-            if ($VerboseMode) { Write-Note ("[NO CHANGE] {0} already has desired {1} mask ({2})." -f $upn, $LicenseSkuParts[$bucket], $bucket) }
+            if ($VerboseMode) { Write-Note ("[NO CHANGE] {0} already has desired mask for {1}" -f $upn, $grp.Part) }
           }
         }
       }
@@ -496,7 +531,7 @@ function Step-5e_CloudMailboxPermissions {
       if ($PermFastMode) {
         if ($ApplyChanges) {
           try {
-            Add-MailboxPermission -Identity $mb.UserPrincipalName -User "Exchange Mailbox Administrators" -AccessRights FullAccess -AutoMapping:$false -Confirm:$false -ErrorAction Stop
+            Add-MailboxPermission -Identity $mb.UserPrincipalName -User "Exchange Mailbox Administrators" -AccessRights FullAccess -AutoMapping:$false -Confirm:$false -ErrorAction Stop -WarningAction SilentlyContinue
             $added++; if ($VerboseMode) { Write-Info ("Added FullAccess → {0}" -f $mb.UserPrincipalName) }
           } catch {
             $msg = $_.Exception.Message
@@ -515,7 +550,7 @@ function Step-5e_CloudMailboxPermissions {
         } else {
           if ($ApplyChanges) {
             try {
-              Add-MailboxPermission -Identity $mb.UserPrincipalName -User "Exchange Mailbox Administrators" -AccessRights FullAccess -AutoMapping:$false -Confirm:$false -ErrorAction Stop
+              Add-MailboxPermission -Identity $mb.UserPrincipalName -User "Exchange Mailbox Administrators" -AccessRights FullAccess -AutoMapping:$false -Confirm:$false -ErrorAction Stop -WarningAction SilentlyContinue
               $added++; if ($VerboseMode) { Write-Info ("Added FullAccess → {0}" -f $mb.UserPrincipalName) }
             } catch { $failed++; Write-Wrn ("Add permission failed for {0}: {1}" -f $mb.UserPrincipalName, $_.Exception.Message) }
           } else {
